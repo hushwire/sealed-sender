@@ -23,7 +23,7 @@ the inner ciphertext.
 
 ## Usage
 
-```rust
+```rust,ignore
 use sealed_sender::{
     seal_message, unseal_message, issue_certificate,
     Config, UserId, DeviceId, IdentityKey, ServerKeyId,
