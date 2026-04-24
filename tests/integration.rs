@@ -1,9 +1,10 @@
+use chrono::{DateTime, TimeZone, Utc};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use sealed_sender::{
-    Config, DeviceId, IdentityKey, SenderIdentity, ServerKeyId, Timestamp, TrustRoot, UserId,
+    Config, DeviceId, IdentityKey, SenderIdentity, ServerKeyId, TrustRoot, UserId,
     issue_certificate, seal_message, unseal_message, verify_certificate,
 };
 
@@ -36,7 +37,7 @@ fn end_to_end_seal_unseal() {
         &server_key,
         server_key_id,
         &alice_identity,
-        Timestamp::from_secs(u64::MAX),
+        DateTime::<Utc>::MAX_UTC,
     )
     .unwrap();
 
@@ -57,7 +58,7 @@ fn end_to_end_seal_unseal() {
         &config,
         &bob_secret,
         &trust_root,
-        Timestamp::from_secs(0),
+        Utc.timestamp_opt(0, 0).unwrap(),
         &wire_bytes,
     )
     .unwrap();
@@ -78,7 +79,7 @@ fn multi_device_same_message() {
         &server_key,
         server_key_id,
         &alice_identity,
-        Timestamp::from_secs(u64::MAX),
+        DateTime::<Utc>::MAX_UTC,
     )
     .unwrap();
 
@@ -120,7 +121,7 @@ fn multi_device_same_message() {
         &config,
         &bob_device_1,
         &trust_root,
-        Timestamp::from_secs(0),
+        Utc.timestamp_opt(0, 0).unwrap(),
         &wire_1,
     )
     .unwrap();
@@ -129,7 +130,7 @@ fn multi_device_same_message() {
         &config,
         &bob_device_2,
         &trust_root,
-        Timestamp::from_secs(0),
+        Utc.timestamp_opt(0, 0).unwrap(),
         &wire_2,
     )
     .unwrap();
@@ -150,7 +151,7 @@ fn wrong_recipient_cannot_unseal() {
         &server_key,
         server_key_id,
         &alice_identity,
-        Timestamp::from_secs(u64::MAX),
+        DateTime::<Utc>::MAX_UTC,
     )
     .unwrap();
 
@@ -170,7 +171,7 @@ fn wrong_recipient_cannot_unseal() {
         &config,
         &eve_secret,
         &trust_root,
-        Timestamp::from_secs(0),
+        Utc.timestamp_opt(0, 0).unwrap(),
         &wire_bytes,
     );
 
@@ -188,7 +189,7 @@ fn expired_cert_rejected_on_unseal() {
         &server_key,
         server_key_id,
         &alice_identity,
-        Timestamp::from_secs(1000),
+        Utc.timestamp_opt(1000, 0).unwrap(),
     )
     .unwrap();
 
@@ -208,7 +209,7 @@ fn expired_cert_rejected_on_unseal() {
         &config,
         &bob_secret,
         &trust_root,
-        Timestamp::from_secs(2000),
+        Utc.timestamp_opt(2000, 0).unwrap(),
         &wire_bytes,
     );
 
@@ -228,7 +229,7 @@ fn custom_config_label() {
         &server_key,
         server_key_id,
         &alice_identity,
-        Timestamp::from_secs(u64::MAX),
+        DateTime::<Utc>::MAX_UTC,
     )
     .unwrap();
 
@@ -247,7 +248,7 @@ fn custom_config_label() {
         &config,
         &bob_secret,
         &trust_root,
-        Timestamp::from_secs(0),
+        Utc.timestamp_opt(0, 0).unwrap(),
         &wire_bytes,
     )
     .unwrap();
@@ -259,7 +260,7 @@ fn custom_config_label() {
         &wrong_config,
         &bob_secret,
         &trust_root,
-        Timestamp::from_secs(0),
+        Utc.timestamp_opt(0, 0).unwrap(),
         &wire_bytes,
     );
     assert!(result.is_err());
@@ -274,10 +275,10 @@ fn verify_certificate_standalone() {
         &server_key,
         server_key_id,
         &alice_identity,
-        Timestamp::from_secs(5000),
+        Utc.timestamp_opt(5000, 0).unwrap(),
     )
     .unwrap();
 
-    verify_certificate(&trust_root, &cert, Timestamp::from_secs(4999)).unwrap();
-    assert!(verify_certificate(&trust_root, &cert, Timestamp::from_secs(5000)).is_err());
+    verify_certificate(&trust_root, &cert, Utc.timestamp_opt(4999, 0).unwrap()).unwrap();
+    assert!(verify_certificate(&trust_root, &cert, Utc.timestamp_opt(5000, 0).unwrap()).is_err());
 }

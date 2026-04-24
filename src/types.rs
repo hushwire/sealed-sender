@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+/// A user identifier (16 bytes, typically a UUID).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UserId([u8; 16]);
 
@@ -14,6 +15,7 @@ impl UserId {
     }
 }
 
+/// A device identifier within a user account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeviceId(u32);
 
@@ -27,6 +29,9 @@ impl DeviceId {
     }
 }
 
+/// An X25519 public key used as a long-term identity key.
+///
+/// Equality comparison is constant-time via [`subtle::ConstantTimeEq`].
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct IdentityKey([u8; 32]);
 
@@ -67,12 +72,15 @@ impl From<&IdentityKey> for x25519_dalek::PublicKey {
 }
 
 #[cfg(feature = "mls-rs")]
-impl From<&mls_rs_core::crypto::HpkePublicKey> for IdentityKey {
-    fn from(key: &mls_rs_core::crypto::HpkePublicKey) -> Self {
+impl TryFrom<&mls_rs_core::crypto::HpkePublicKey> for IdentityKey {
+    type Error = crate::error::Error;
+
+    fn try_from(key: &mls_rs_core::crypto::HpkePublicKey) -> crate::error::Result<Self> {
         let bytes: &[u8] = key.as_ref();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes[..32]);
-        Self(arr)
+        let arr: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| crate::error::Error::InvalidKey)?;
+        Ok(Self(arr))
     }
 }
 
@@ -83,6 +91,9 @@ impl From<IdentityKey> for mls_rs_core::crypto::HpkePublicKey {
     }
 }
 
+/// Identifies which server Ed25519 signing key issued a certificate.
+///
+/// Supports key rotation: the [`TrustRoot`](crate::TrustRoot) maps `ServerKeyId` to public keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ServerKeyId(u32);
 
@@ -93,27 +104,6 @@ impl ServerKeyId {
 
     pub fn as_u32(&self) -> u32 {
         self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Timestamp(u64);
-
-impl Timestamp {
-    pub fn from_secs(secs: u64) -> Self {
-        Self(secs)
-    }
-
-    pub fn as_secs(&self) -> u64 {
-        self.0
-    }
-
-    pub fn now() -> Self {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        Self(secs)
     }
 }
 
@@ -131,12 +121,17 @@ impl From<UserId> for uuid::Uuid {
     }
 }
 
+/// The sender's identity fields needed to issue a [`SenderCertificate`](crate::SenderCertificate).
 pub struct SenderIdentity {
     pub user_id: UserId,
     pub device_id: DeviceId,
     pub identity_key: IdentityKey,
 }
 
+/// Protocol configuration.
+///
+/// The `label` field is the HKDF domain separation label. Override it to
+/// prevent cross-protocol key reuse (e.g. `b"HushwireSealedSender-v1"`).
 pub struct Config {
     pub label: &'static [u8],
 }

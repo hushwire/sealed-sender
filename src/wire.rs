@@ -2,17 +2,26 @@ use crate::error::{Error, Result};
 use crate::sealed_sender::SealedEnvelope;
 use crate::types::{DeviceId, UserId};
 
+/// Current wire format version.
 pub const VERSION: u8 = 0x01;
 
+/// Size of the version field in bytes.
 pub const VERSION_LEN: usize = 1;
+/// Size of the user ID field in bytes.
 pub const USER_ID_LEN: usize = 16;
+/// Size of the device ID field in bytes.
 pub const DEVICE_ID_LEN: usize = 4;
+/// Size of the ephemeral public key field in bytes.
 pub const EK_PUB_LEN: usize = 32;
-pub const ENCRYPTED_STATIC_LEN: usize = 48; // 32 ct + 16 tag
+/// Size of the encrypted static key field (32 ciphertext + 16 Poly1305 tag).
+pub const ENCRYPTED_STATIC_LEN: usize = 48;
 
+/// Size of the routing header (version + user ID + device ID).
 pub const HEADER_LEN: usize = VERSION_LEN + USER_ID_LEN + DEVICE_ID_LEN;
+/// Minimum valid wire message size (header + ephemeral key + encrypted static).
 pub const MIN_MESSAGE_LEN: usize = HEADER_LEN + EK_PUB_LEN + ENCRYPTED_STATIC_LEN;
 
+/// A parsed sealed sender wire message with zero-copy references into the input bytes.
 #[derive(Debug)]
 pub struct DecodedMessage<'a> {
     pub recipient_id: UserId,
@@ -22,11 +31,18 @@ pub struct DecodedMessage<'a> {
     pub encrypted_message: &'a [u8],
 }
 
-pub fn encode(
-    recipient_id: UserId,
-    recipient_device_id: DeviceId,
-    envelope: &SealedEnvelope,
-) -> Vec<u8> {
+/// Build the routing header bytes (version + recipient ID + device ID).
+pub fn build_header(recipient_id: UserId, recipient_device_id: DeviceId) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[0] = VERSION;
+    header[VERSION_LEN..VERSION_LEN + USER_ID_LEN].copy_from_slice(recipient_id.as_bytes());
+    header[VERSION_LEN + USER_ID_LEN..HEADER_LEN]
+        .copy_from_slice(&recipient_device_id.as_u32().to_le_bytes());
+    header
+}
+
+/// Encode a sealed envelope with a pre-built routing header into wire-format bytes.
+pub fn encode_with_header(header: &[u8; HEADER_LEN], envelope: &SealedEnvelope) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         HEADER_LEN
             + EK_PUB_LEN
@@ -34,9 +50,7 @@ pub fn encode(
             + envelope.encrypted_message.len(),
     );
 
-    out.push(VERSION);
-    out.extend_from_slice(recipient_id.as_bytes());
-    out.extend_from_slice(&recipient_device_id.as_u32().to_le_bytes());
+    out.extend_from_slice(header);
     out.extend_from_slice(&envelope.ek_pub);
     out.extend_from_slice(&envelope.encrypted_static);
     out.extend_from_slice(&envelope.encrypted_message);
@@ -44,6 +58,17 @@ pub fn encode(
     out
 }
 
+/// Encode a sealed envelope into wire-format bytes.
+pub fn encode(
+    recipient_id: UserId,
+    recipient_device_id: DeviceId,
+    envelope: &SealedEnvelope,
+) -> Vec<u8> {
+    let header = build_header(recipient_id, recipient_device_id);
+    encode_with_header(&header, envelope)
+}
+
+/// Parse wire-format bytes into a [`DecodedMessage`] with zero-copy field references.
 pub fn decode(bytes: &[u8]) -> Result<DecodedMessage<'_>> {
     if bytes.len() < MIN_MESSAGE_LEN {
         return Err(Error::MessageTooShort);

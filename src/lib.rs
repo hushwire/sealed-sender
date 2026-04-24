@@ -11,8 +11,9 @@ pub use certificate::{
     SenderCertificate, SignedSenderCertificate, TrustRoot, issue_certificate, verify_certificate,
 };
 pub use error::{Error, Result};
-pub use types::{Config, DeviceId, IdentityKey, SenderIdentity, ServerKeyId, Timestamp, UserId};
+pub use types::{Config, DeviceId, IdentityKey, SenderIdentity, ServerKeyId, UserId};
 
+use chrono::{DateTime, Utc};
 use x25519_dalek::StaticSecret;
 
 /// Seal an inner ciphertext for delivery to a specific recipient device.
@@ -30,15 +31,18 @@ pub fn seal_message(
     recipient_identity_public: &IdentityKey,
     inner_ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
+    let routing_header = wire::build_header(recipient_id, recipient_device_id);
+
     let envelope = sealed_sender::seal(
         config,
         sender_identity,
         sender_cert,
         recipient_identity_public,
         inner_ciphertext,
+        &routing_header,
     )?;
 
-    Ok(wire::encode(recipient_id, recipient_device_id, &envelope))
+    Ok(wire::encode_with_header(&routing_header, &envelope))
 }
 
 /// Unseal a wire-format sealed sender message.
@@ -50,7 +54,7 @@ pub fn unseal_message(
     config: &Config,
     recipient_identity: &StaticSecret,
     trust_root: &TrustRoot,
-    now: Timestamp,
+    now: DateTime<Utc>,
     wire_bytes: &[u8],
 ) -> Result<(SenderCertificate, Vec<u8>)> {
     let msg = wire::decode(wire_bytes)?;

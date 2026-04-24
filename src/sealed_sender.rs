@@ -7,15 +7,24 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+use chrono::{DateTime, Utc};
+
 use crate::certificate::{
     SenderCertificate, SignedSenderCertificate, TrustRoot, verify_certificate,
 };
 use crate::error::{Error, Result};
-use crate::types::{Config, IdentityKey, Timestamp};
+use crate::types::{Config, IdentityKey};
 
+/// The output of [`seal`]: an ECIES envelope ready for wire encoding.
+///
+/// Contains the ephemeral public key and two ciphertext layers
+/// (encrypted sender identity key + encrypted message payload).
 pub struct SealedEnvelope {
+    /// Ephemeral X25519 public key (fresh per message).
     pub ek_pub: [u8; 32],
+    /// Stage 1 ciphertext: sender's static identity key (32 bytes + 16-byte Poly1305 tag).
     pub encrypted_static: Vec<u8>,
+    /// Stage 2 ciphertext: sender certificate + inner ciphertext (variable + 16-byte tag).
     pub encrypted_message: Vec<u8>,
 }
 
@@ -131,12 +140,16 @@ fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) ->
 }
 
 /// Seal an inner ciphertext using the two-stage ECIES protocol.
+///
+/// `routing_header` is the wire format header (version + recipient_id + device_id)
+/// bound into the stage 2 AEAD as additional authenticated data.
 pub fn seal(
     config: &Config,
     sender_identity: &StaticSecret,
     sender_cert: &SignedSenderCertificate,
     recipient_identity_public: &IdentityKey,
     inner_ciphertext: &[u8],
+    routing_header: &[u8],
 ) -> Result<SealedEnvelope> {
     let recipient_pub = PublicKey::from(recipient_identity_public);
     let sender_pub = PublicKey::from(sender_identity);
@@ -178,14 +191,14 @@ pub fn seal(
     inner_payload.extend_from_slice(&cert_bytes);
     inner_payload.extend_from_slice(inner_ciphertext);
 
-    // AAD will be supplied by the caller (the routing header + encrypted_static).
-    // Here we build the message_aad that binds the routing header at the wire level.
-    // For the internal seal(), we use encrypted_static as the AAD since the routing
-    // header binding happens at the wire::encode level.
+    let mut message_aad = Vec::with_capacity(routing_header.len() + encrypted_static.len());
+    message_aad.extend_from_slice(routing_header);
+    message_aad.extend_from_slice(&encrypted_static);
+
     let encrypted_message = aead_seal(
         &static_keys.enc_key,
         &static_keys.nonce,
-        &encrypted_static,
+        &message_aad,
         &inner_payload,
     )?;
 
@@ -205,7 +218,7 @@ pub fn unseal(
     config: &Config,
     recipient_identity: &StaticSecret,
     trust_root: &TrustRoot,
-    now: Timestamp,
+    now: DateTime<Utc>,
     ek_pub_bytes: &[u8; 32],
     encrypted_static: &[u8],
     encrypted_message: &[u8],
@@ -216,7 +229,7 @@ pub fn unseal(
 
     // --- Stage 1: Ephemeral ECDH → decrypt sender's static identity key ---
 
-    let ecdh_ephemeral_result = ecdh(&StaticSecret::from(recipient_identity.to_bytes()), &ek_pub)?;
+    let ecdh_ephemeral_result = ecdh(recipient_identity, &ek_pub)?;
 
     let ephemeral_keys = derive_ephemeral_keys(
         config,
@@ -243,10 +256,7 @@ pub fn unseal(
 
     // --- Stage 2: Static ECDH → decrypt message ---
 
-    let ecdh_static_result = ecdh(
-        &StaticSecret::from(recipient_identity.to_bytes()),
-        &sender_pub,
-    )?;
+    let ecdh_static_result = ecdh(recipient_identity, &sender_pub)?;
 
     let static_keys = derive_static_keys(
         &ecdh_static_result,
@@ -254,11 +264,14 @@ pub fn unseal(
         encrypted_static,
     )?;
 
-    let _ = routing_header; // reserved for future AAD binding
+    let mut message_aad = Vec::with_capacity(routing_header.len() + encrypted_static.len());
+    message_aad.extend_from_slice(routing_header);
+    message_aad.extend_from_slice(encrypted_static);
+
     let inner_payload = aead_open(
         &static_keys.enc_key,
         &static_keys.nonce,
-        encrypted_static,
+        &message_aad,
         encrypted_message,
     )?;
 
@@ -289,6 +302,7 @@ mod tests {
     use super::*;
     use crate::certificate::issue_certificate;
     use crate::types::{DeviceId, SenderIdentity, ServerKeyId, UserId};
+    use chrono::TimeZone;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
 
@@ -323,7 +337,7 @@ mod tests {
             &server_key,
             server_key_id,
             &sender_identity,
-            Timestamp::from_secs(u64::MAX),
+            DateTime::<Utc>::MAX_UTC,
         )
         .unwrap();
 
@@ -347,21 +361,21 @@ mod tests {
         let ctx = setup();
         let plaintext = b"hello MLS ciphertext";
 
+        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let envelope = seal(
             &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             plaintext,
+            &routing_header,
         )
         .unwrap();
-
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let (cert, inner) = unseal(
             &ctx.config,
             &ctx.recipient_static,
             &ctx.trust_root,
-            Timestamp::from_secs(0),
+            Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
@@ -377,12 +391,14 @@ mod tests {
     #[test]
     fn wrong_recipient_key_fails() {
         let ctx = setup();
+        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let envelope = seal(
             &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"secret",
+            &routing_header,
         )
         .unwrap();
 
@@ -392,7 +408,7 @@ mod tests {
             &ctx.config,
             &wrong_key,
             &ctx.trust_root,
-            Timestamp::from_secs(0),
+            Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
@@ -405,12 +421,14 @@ mod tests {
     #[test]
     fn tampered_encrypted_static_fails() {
         let ctx = setup();
+        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let envelope = seal(
             &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"secret",
+            &routing_header,
         )
         .unwrap();
 
@@ -422,7 +440,7 @@ mod tests {
             &ctx.config,
             &ctx.recipient_static,
             &ctx.trust_root,
-            Timestamp::from_secs(0),
+            Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &tampered_static,
             &envelope.encrypted_message,
@@ -435,12 +453,14 @@ mod tests {
     #[test]
     fn tampered_encrypted_message_fails() {
         let ctx = setup();
+        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let envelope = seal(
             &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"secret",
+            &routing_header,
         )
         .unwrap();
 
@@ -452,7 +472,7 @@ mod tests {
             &ctx.config,
             &ctx.recipient_static,
             &ctx.trust_root,
-            Timestamp::from_secs(0),
+            Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &tampered_msg,
@@ -466,6 +486,7 @@ mod tests {
     fn ephemeral_key_is_fresh() {
         let ctx = setup();
         let plaintext = b"same message";
+        let routing_header = [0u8; crate::wire::HEADER_LEN];
 
         let envelope1 = seal(
             &ctx.config,
@@ -473,6 +494,7 @@ mod tests {
             &ctx.sender_cert,
             &ctx.recipient_pub,
             plaintext,
+            &routing_header,
         )
         .unwrap();
 
@@ -482,6 +504,7 @@ mod tests {
             &ctx.sender_cert,
             &ctx.recipient_pub,
             plaintext,
+            &routing_header,
         )
         .unwrap();
 
@@ -493,6 +516,7 @@ mod tests {
     #[test]
     fn empty_inner_ciphertext() {
         let ctx = setup();
+        let routing_header = [0u8; crate::wire::HEADER_LEN];
 
         let envelope = seal(
             &ctx.config,
@@ -500,15 +524,14 @@ mod tests {
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"",
+            &routing_header,
         )
         .unwrap();
-
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let (_, inner) = unseal(
             &ctx.config,
             &ctx.recipient_static,
             &ctx.trust_root,
-            Timestamp::from_secs(0),
+            Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
@@ -523,6 +546,7 @@ mod tests {
     fn large_inner_ciphertext() {
         let ctx = setup();
         let large_payload = vec![0x42u8; 1_000_000];
+        let routing_header = [0u8; crate::wire::HEADER_LEN];
 
         let envelope = seal(
             &ctx.config,
@@ -530,15 +554,14 @@ mod tests {
             &ctx.sender_cert,
             &ctx.recipient_pub,
             &large_payload,
+            &routing_header,
         )
         .unwrap();
-
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let (_, inner) = unseal(
             &ctx.config,
             &ctx.recipient_static,
             &ctx.trust_root,
-            Timestamp::from_secs(0),
+            Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
@@ -569,21 +592,28 @@ mod tests {
             &server_key,
             server_key_id,
             &sender_identity,
-            Timestamp::from_secs(u64::MAX),
+            DateTime::<Utc>::MAX_UTC,
         )
         .unwrap();
 
         let recipient_static = StaticSecret::random_from_rng(OsRng);
         let recipient_pub = IdentityKey::from(PublicKey::from(&recipient_static));
 
-        let envelope = seal(&config, &sender_static, &bad_cert, &recipient_pub, b"test").unwrap();
-
         let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let envelope = seal(
+            &config,
+            &sender_static,
+            &bad_cert,
+            &recipient_pub,
+            b"test",
+            &routing_header,
+        )
+        .unwrap();
         let result = unseal(
             &config,
             &recipient_static,
             &trust_root,
-            Timestamp::from_secs(0),
+            Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
