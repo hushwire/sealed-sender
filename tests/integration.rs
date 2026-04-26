@@ -4,21 +4,18 @@ use rand_core::OsRng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use sealed_sender::{
-    IdentityKey, Recipient, ReplayFilter, SenderIdentity, ServerKeyId, TrustRoot,
-    issue_certificate, seal_message, unseal_message, unseal_with_replay_check,
-    verify_certificate,
+    IdentityKey, Recipient, ReplayFilter, SenderIdentity, SigningKeyId, TrustRoot,
+    issue_certificate, seal_message, unseal_message, unseal_with_replay_check, verify_certificate,
 };
 
-fn setup_server() -> (SigningKey, ServerKeyId, TrustRoot) {
-    let server_key = SigningKey::generate(&mut OsRng);
-    let server_key_id = ServerKeyId::new(1);
-    let trust_root = TrustRoot::new(server_key_id, server_key.verifying_key());
-    (server_key, server_key_id, trust_root)
+fn setup_issuer() -> (SigningKey, SigningKeyId, TrustRoot) {
+    let issuer_key = SigningKey::generate(&mut OsRng);
+    let signing_key_id = SigningKeyId::new(1);
+    let trust_root = TrustRoot::new(signing_key_id, issuer_key.verifying_key());
+    (issuer_key, signing_key_id, trust_root)
 }
 
-fn setup_user(
-    id: &[u8],
-) -> (StaticSecret, IdentityKey, SenderIdentity<Recipient>) {
+fn setup_user(id: &[u8]) -> (StaticSecret, IdentityKey, SenderIdentity<Recipient>) {
     let secret = StaticSecret::random_from_rng(OsRng);
     let public = IdentityKey::from(PublicKey::from(&secret));
     let identity = SenderIdentity {
@@ -30,13 +27,13 @@ fn setup_user(
 
 #[test]
 fn end_to_end_seal_unseal() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (alice_secret, _, alice_identity) = setup_user(&[0xAA; 16]);
     let (bob_secret, bob_pub, _) = setup_user(&[0xBB; 16]);
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         DateTime::<Utc>::MAX_UTC,
     )
@@ -71,12 +68,12 @@ fn end_to_end_seal_unseal() {
 
 #[test]
 fn multi_device_same_message() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (alice_secret, _, alice_identity) = setup_user(&[0xAA; 16]);
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         DateTime::<Utc>::MAX_UTC,
     )
@@ -137,28 +134,21 @@ fn multi_device_same_message() {
 
 #[test]
 fn wrong_recipient_cannot_unseal() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (alice_secret, _, alice_identity) = setup_user(&[0xAA; 16]);
     let (_, bob_pub, _) = setup_user(&[0xBB; 16]);
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         DateTime::<Utc>::MAX_UTC,
     )
     .unwrap();
 
     let bob_rid = Recipient::from_bytes_copy(&[0xBB; 16]);
-    let wire_bytes = seal_message(
-        &alice_secret,
-        &alice_cert,
-        &bob_rid,
-        1,
-        &bob_pub,
-        b"secret",
-    )
-    .unwrap();
+    let wire_bytes =
+        seal_message(&alice_secret, &alice_cert, &bob_rid, 1, &bob_pub, b"secret").unwrap();
 
     let eve_secret = StaticSecret::random_from_rng(OsRng);
     let result = unseal_message::<Recipient>(
@@ -173,28 +163,21 @@ fn wrong_recipient_cannot_unseal() {
 
 #[test]
 fn expired_cert_rejected_on_unseal() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (alice_secret, _, alice_identity) = setup_user(&[0xAA; 16]);
     let (bob_secret, bob_pub, _) = setup_user(&[0xBB; 16]);
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         Utc.timestamp_opt(1000, 0).unwrap(),
     )
     .unwrap();
 
     let bob_rid = Recipient::from_bytes_copy(&[0xBB; 16]);
-    let wire_bytes = seal_message(
-        &alice_secret,
-        &alice_cert,
-        &bob_rid,
-        1,
-        &bob_pub,
-        b"secret",
-    )
-    .unwrap();
+    let wire_bytes =
+        seal_message(&alice_secret, &alice_cert, &bob_rid, 1, &bob_pub, b"secret").unwrap();
 
     let result = unseal_message::<Recipient>(
         &bob_secret,
@@ -208,12 +191,12 @@ fn expired_cert_rejected_on_unseal() {
 
 #[test]
 fn verify_certificate_standalone() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (_, _, alice_identity) = setup_user(&[0xAA; 16]);
 
     let cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         Utc.timestamp_opt(5000, 0).unwrap(),
     )
@@ -225,13 +208,13 @@ fn verify_certificate_standalone() {
 
 #[test]
 fn end_to_end_wire_format_roundtrip() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (alice_secret, _, alice_identity) = setup_user(&[0xAA; 16]);
     let (bob_secret, bob_pub, _) = setup_user(&[0xBB; 16]);
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         DateTime::<Utc>::MAX_UTC,
     )
@@ -241,15 +224,8 @@ fn end_to_end_wire_format_roundtrip() {
     let seq = 42u64;
     let bob_rid = Recipient::from_bytes_copy(&[0xBB; 16]);
 
-    let wire_bytes = seal_message(
-        &alice_secret,
-        &alice_cert,
-        &bob_rid,
-        seq,
-        &bob_pub,
-        inner,
-    )
-    .unwrap();
+    let wire_bytes =
+        seal_message(&alice_secret, &alice_cert, &bob_rid, seq, &bob_pub, inner).unwrap();
 
     assert_eq!(wire_bytes[0], 0x01); // version
     assert_eq!(&wire_bytes[1..3], &16u16.to_le_bytes()); // recipient id length
@@ -270,33 +246,26 @@ fn end_to_end_wire_format_roundtrip() {
     assert_eq!(decrypted, inner);
     assert_eq!(returned_seq, seq);
     assert_eq!(sender_cert.sender_id, alice_identity.id);
-    assert_eq!(sender_cert.server_key_id, server_key_id);
+    assert_eq!(sender_cert.signing_key_id, signing_key_id);
 }
 
 #[test]
 fn tampered_sequence_number_detected() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (alice_secret, _, alice_identity) = setup_user(&[0xAA; 16]);
     let (bob_secret, bob_pub, _) = setup_user(&[0xBB; 16]);
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         DateTime::<Utc>::MAX_UTC,
     )
     .unwrap();
 
     let bob_rid = Recipient::from_bytes_copy(&[0xBB; 16]);
-    let mut wire_bytes = seal_message(
-        &alice_secret,
-        &alice_cert,
-        &bob_rid,
-        1,
-        &bob_pub,
-        b"secret",
-    )
-    .unwrap();
+    let mut wire_bytes =
+        seal_message(&alice_secret, &alice_cert, &bob_rid, 1, &bob_pub, b"secret").unwrap();
 
     // Tamper with the message_sequence field (starts at offset 19 for a 16-byte recipient)
     wire_bytes[19] ^= 0xFF;
@@ -313,13 +282,13 @@ fn tampered_sequence_number_detected() {
 
 #[test]
 fn unseal_with_replay_check_rejects_duplicate() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
     let (alice_secret, _, alice_identity) = setup_user(&[0xAA; 16]);
     let (bob_secret, bob_pub, _) = setup_user(&[0xBB; 16]);
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &alice_identity,
         DateTime::<Utc>::MAX_UTC,
     )
@@ -346,14 +315,19 @@ fn unseal_with_replay_check_rejects_duplicate() {
     assert_eq!(seq, 1);
     assert_eq!(cert.sender_id, alice_identity.id);
 
-    let result =
-        unseal_with_replay_check::<Recipient>(&bob_secret, &trust_root, now, &wire_bytes, &mut replay);
+    let result = unseal_with_replay_check::<Recipient>(
+        &bob_secret,
+        &trust_root,
+        now,
+        &wire_bytes,
+        &mut replay,
+    );
     assert!(matches!(result, Err(sealed_sender::Error::Replay)));
 }
 
 #[test]
 fn variable_length_recipient_ids() {
-    let (server_key, server_key_id, trust_root) = setup_server();
+    let (issuer_key, signing_key_id, trust_root) = setup_issuer();
 
     let sender_secret = StaticSecret::random_from_rng(OsRng);
     let sender_pub = IdentityKey::from(PublicKey::from(&sender_secret));
@@ -363,8 +337,8 @@ fn variable_length_recipient_ids() {
     };
 
     let alice_cert = issue_certificate(
-        &server_key,
-        server_key_id,
+        &issuer_key,
+        signing_key_id,
         &sender_identity,
         DateTime::<Utc>::MAX_UTC,
     )
@@ -393,5 +367,8 @@ fn variable_length_recipient_ids() {
     .unwrap();
 
     assert_eq!(inner, b"hello variable-length ids");
-    assert_eq!(cert.sender_id, Recipient::from_bytes_copy(b"alice@example.com"));
+    assert_eq!(
+        cert.sender_id,
+        Recipient::from_bytes_copy(b"alice@example.com")
+    );
 }
