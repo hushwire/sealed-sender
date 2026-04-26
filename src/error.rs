@@ -45,4 +45,12 @@ pub enum Error {
     /// The wire-format message is shorter than the minimum valid size.
     #[error("message too short")]
     MessageTooShort,
+
+    /// The message sequence number has already been seen (replay) or is too old.
+    #[error("replayed or out-of-window sequence number")]
+    Replay,
+
+    /// The recipient identifier bytes are invalid for the expected type.
+    #[error("invalid recipient identifier")]
+    InvalidRecipientId,
 }

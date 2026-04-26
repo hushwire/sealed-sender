@@ -17,17 +17,24 @@ message) in a two-layer ECIES envelope:
    certificate and inner ciphertext.
 
 The server routes the message using the plaintext routing header
-(recipient ID + device ID) but cannot see who sent it. The recipient decrypts
-both layers, verifies the sender's Ed25519-signed certificate, and recovers
-the inner ciphertext.
+(recipient ID) but cannot see who sent it. The recipient decrypts both layers,
+verifies the sender's Ed25519-signed certificate, and recovers the inner
+ciphertext.
+
+## Generic identity model
+
+The library is generic over recipient/sender identifiers via the `RecipientId`
+trait. Your identity type might be a UUID, a (user, device) pair, a string
+handle, or anything serializable. Implement `RecipientId` for your type, or
+use the provided `Recipient` opaque byte wrapper.
 
 ## Usage
 
 ```rust,ignore
 use sealed_sender::{
-    seal_message, unseal_message, issue_certificate,
-    Config, UserId, DeviceId, IdentityKey, ServerKeyId,
-    SenderIdentity, TrustRoot,
+    seal_message, unseal_with_replay_check, issue_certificate,
+    Recipient, IdentityKey, ServerKeyId,
+    SenderIdentity, TrustRoot, ReplayFilter,
 };
 
 // Server issues a sender certificate
@@ -37,15 +44,16 @@ let cert = issue_certificate(
 
 // Sender seals a message
 let wire_bytes = seal_message(
-    &Config::default(), &sender_secret, &cert,
-    recipient_id, device_id, &recipient_public_key,
-    &mls_ciphertext,
+    &sender_secret, &cert,
+    &recipient_id, message_sequence,
+    &recipient_public_key, &mls_ciphertext,
 ).unwrap();
 
-// Recipient unseals
-let (sender_cert, inner) = unseal_message(
-    &Config::default(), &recipient_secret, &trust_root,
-    chrono::Utc::now(), &wire_bytes,
+// Recipient unseals with replay protection
+let mut replay_filter = ReplayFilter::new();
+let (sender_cert, seq, inner) = unseal_with_replay_check(
+    &recipient_secret, &trust_root,
+    chrono::Utc::now(), &wire_bytes, &mut replay_filter,
 ).unwrap();
 ```
 
@@ -53,7 +61,7 @@ let (sender_cert, inner) = unseal_message(
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `uuid` | off | `From` conversions between `UserId` and `uuid::Uuid` |
+| `uuid` | off | `From` conversions between `Recipient` and `uuid::Uuid` |
 | `mls-rs` | off | `TryFrom` conversions between `IdentityKey` and `mls_rs_core::crypto::HpkePublicKey` |
 
 ## Security

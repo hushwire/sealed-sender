@@ -1,31 +1,69 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-/// A user identifier (16 bytes, typically a UUID).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct UserId([u8; 16]);
+use crate::error::Result;
 
-impl UserId {
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+#[cfg(feature = "uuid")]
+use crate::error::Error;
+
+/// Trait for recipient (and sender) identifiers in the sealed sender protocol.
+///
+/// Implementors define how their identity type is serialized into the wire
+/// format routing header. The library is agnostic about what an identity
+/// represents: it could be a single UUID, a (user, device) pair, a string
+/// handle, or anything else.
+///
+/// The wire format stores the identity as a length-prefixed byte sequence,
+/// so implementations may return any byte length from [`to_bytes`](RecipientId::to_bytes).
+pub trait RecipientId:
+    Clone + Eq + std::hash::Hash + Serialize + DeserializeOwned + std::fmt::Debug
+{
+    fn to_bytes(&self) -> &[u8];
+    fn from_bytes(bytes: &[u8]) -> Result<Self>;
+}
+
+/// A variable-length opaque recipient identifier.
+///
+/// This is the default [`RecipientId`] implementation provided by the library.
+/// It stores arbitrary bytes, making it compatible with UUIDs, composite
+/// (user + device) identifiers, or any other format.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Recipient(Vec<u8>);
+
+impl Recipient {
+    pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
 
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
+    pub fn from_bytes_copy(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
     }
 }
 
-/// A device identifier within a user account.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DeviceId(u32);
-
-impl DeviceId {
-    pub fn new(id: u32) -> Self {
-        Self(id)
+impl RecipientId for Recipient {
+    fn to_bytes(&self) -> &[u8] {
+        &self.0
     }
 
-    pub fn as_u32(&self) -> u32 {
-        self.0
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self(bytes.to_vec()))
+    }
+}
+
+#[cfg(feature = "uuid")]
+impl From<uuid::Uuid> for Recipient {
+    fn from(id: uuid::Uuid) -> Self {
+        Self(id.as_bytes().to_vec())
+    }
+}
+
+#[cfg(feature = "uuid")]
+impl TryFrom<Recipient> for uuid::Uuid {
+    type Error = Error;
+    fn try_from(r: Recipient) -> Result<Self> {
+        let bytes: [u8; 16] = r.0.try_into().map_err(|_| Error::InvalidRecipientId)?;
+        Ok(uuid::Uuid::from_bytes(bytes))
     }
 }
 
@@ -107,39 +145,8 @@ impl ServerKeyId {
     }
 }
 
-#[cfg(feature = "uuid")]
-impl From<uuid::Uuid> for UserId {
-    fn from(id: uuid::Uuid) -> Self {
-        Self(*id.as_bytes())
-    }
-}
-
-#[cfg(feature = "uuid")]
-impl From<UserId> for uuid::Uuid {
-    fn from(id: UserId) -> Self {
-        uuid::Uuid::from_bytes(id.0)
-    }
-}
-
 /// The sender's identity fields needed to issue a [`SenderCertificate`](crate::SenderCertificate).
-pub struct SenderIdentity {
-    pub user_id: UserId,
-    pub device_id: DeviceId,
+pub struct SenderIdentity<R: RecipientId> {
+    pub id: R,
     pub identity_key: IdentityKey,
-}
-
-/// Protocol configuration.
-///
-/// The `label` field is the HKDF domain separation label. Override it to
-/// prevent cross-protocol key reuse (e.g. `b"HushwireSealedSender-v1"`).
-pub struct Config {
-    pub label: &'static [u8],
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            label: b"SealedSender",
-        }
-    }
 }

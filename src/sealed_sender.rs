@@ -13,7 +13,7 @@ use crate::certificate::{
     SenderCertificate, SignedSenderCertificate, TrustRoot, verify_certificate,
 };
 use crate::error::{Error, Result};
-use crate::types::{Config, IdentityKey};
+use crate::types::{IdentityKey, RecipientId};
 
 /// The output of [`seal`]: an ECIES envelope ready for wire encoding.
 ///
@@ -40,19 +40,17 @@ struct StaticKeys {
 }
 
 fn derive_ephemeral_keys(
-    config: &Config,
     shared_secret: &[u8; 32],
-    recipient_pub: &[u8; 32],
     ek_pub: &[u8; 32],
+    recipient_pub: &[u8; 32],
 ) -> Result<EphemeralKeys> {
-    let mut salt = Vec::with_capacity(config.label.len() + 64);
-    salt.extend_from_slice(config.label);
-    salt.extend_from_slice(recipient_pub);
-    salt.extend_from_slice(ek_pub);
+    let mut salt = [0u8; 64];
+    salt[..32].copy_from_slice(ek_pub);
+    salt[32..].copy_from_slice(recipient_pub);
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
     let mut okm = Zeroizing::new([0u8; 76]);
-    hk.expand(b"", okm.as_mut())
+    hk.expand(b"HushwireSealedSender-v1", okm.as_mut())
         .map_err(|_| Error::InvalidKey)?;
 
     let mut chain_key = Zeroizing::new([0u8; 32]);
@@ -81,7 +79,7 @@ fn derive_static_keys(
 
     let hk = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
     let mut okm = Zeroizing::new([0u8; 44]);
-    hk.expand(b"", okm.as_mut())
+    hk.expand(b"HushwireSealedSender-v1-static", okm.as_mut())
         .map_err(|_| Error::InvalidKey)?;
 
     let mut enc_key = Zeroizing::new([0u8; 32]);
@@ -141,12 +139,11 @@ fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) ->
 
 /// Seal an inner ciphertext using the two-stage ECIES protocol.
 ///
-/// `routing_header` is the wire format header (version + recipient_id + device_id)
-/// bound into the stage 2 AEAD as additional authenticated data.
-pub fn seal(
-    config: &Config,
+/// `routing_header` is the wire format header bound into the stage 2 AEAD
+/// as additional authenticated data.
+pub fn seal<R: RecipientId>(
     sender_identity: &StaticSecret,
-    sender_cert: &SignedSenderCertificate,
+    sender_cert: &SignedSenderCertificate<R>,
     recipient_identity_public: &IdentityKey,
     inner_ciphertext: &[u8],
     routing_header: &[u8],
@@ -163,10 +160,9 @@ pub fn seal(
     let ecdh_ephemeral_result = ecdh_ephemeral(ek_secret, &recipient_pub)?;
 
     let ephemeral_keys = derive_ephemeral_keys(
-        config,
         &ecdh_ephemeral_result,
-        recipient_identity_public.as_bytes(),
         &ek_pub_bytes,
+        recipient_identity_public.as_bytes(),
     )?;
 
     let encrypted_static = aead_seal(
@@ -211,11 +207,14 @@ pub fn seal(
 
 /// Unseal a sealed sender message using the two-stage ECIES protocol.
 ///
-/// `routing_header` is the first 21 bytes of the wire message (version + recipient_id + device_id)
-/// used as additional authenticated data.
+/// Returns the verified [`SenderCertificate`] and the inner ciphertext.
+///
+/// **Replay protection is NOT performed by this function.** Callers must
+/// either use [`crate::unseal_with_replay_check`] (recommended) or manually
+/// pass the returned sequence number to [`crate::ReplayFilter::check`] after
+/// calling [`crate::unseal_message`].
 #[allow(clippy::too_many_arguments)]
-pub fn unseal(
-    config: &Config,
+pub fn unseal<R: RecipientId>(
     recipient_identity: &StaticSecret,
     trust_root: &TrustRoot,
     now: DateTime<Utc>,
@@ -223,7 +222,7 @@ pub fn unseal(
     encrypted_static: &[u8],
     encrypted_message: &[u8],
     routing_header: &[u8],
-) -> Result<(SenderCertificate, Vec<u8>)> {
+) -> Result<(SenderCertificate<R>, Vec<u8>)> {
     let ek_pub = PublicKey::from(*ek_pub_bytes);
     let recipient_pub = PublicKey::from(recipient_identity);
 
@@ -232,10 +231,9 @@ pub fn unseal(
     let ecdh_ephemeral_result = ecdh(recipient_identity, &ek_pub)?;
 
     let ephemeral_keys = derive_ephemeral_keys(
-        config,
         &ecdh_ephemeral_result,
-        &recipient_pub.to_bytes(),
         ek_pub_bytes,
+        &recipient_pub.to_bytes(),
     )?;
 
     let sender_pub_bytes = aead_open(
@@ -277,12 +275,11 @@ pub fn unseal(
 
     // --- Validate ---
 
-    let (sender_cert, remaining): (SignedSenderCertificate, _) =
+    let (sender_cert, remaining): (SignedSenderCertificate<R>, _) =
         postcard::take_from_bytes(&inner_payload).map_err(|_| Error::Serialization)?;
 
     let inner_ciphertext = remaining.to_vec();
 
-    // Constant-time: verify decrypted static key matches certificate claim
     if !bool::from(
         sender_cert
             .certificate
@@ -301,26 +298,24 @@ pub fn unseal(
 mod tests {
     use super::*;
     use crate::certificate::issue_certificate;
-    use crate::types::{DeviceId, SenderIdentity, ServerKeyId, UserId};
+    use crate::types::{Recipient, SenderIdentity, ServerKeyId};
     use chrono::TimeZone;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
 
     struct TestContext {
-        config: Config,
         #[allow(dead_code)]
         server_key: SigningKey,
         #[allow(dead_code)]
         server_key_id: ServerKeyId,
         trust_root: TrustRoot,
         sender_static: StaticSecret,
-        sender_cert: SignedSenderCertificate,
+        sender_cert: SignedSenderCertificate<Recipient>,
         recipient_static: StaticSecret,
         recipient_pub: IdentityKey,
     }
 
     fn setup() -> TestContext {
-        let config = Config::default();
         let server_key = SigningKey::generate(&mut OsRng);
         let server_key_id = ServerKeyId::new(1);
         let trust_root = TrustRoot::new(server_key_id, server_key.verifying_key());
@@ -328,8 +323,7 @@ mod tests {
         let sender_static = StaticSecret::random_from_rng(OsRng);
         let sender_pub = PublicKey::from(&sender_static);
         let sender_identity = SenderIdentity {
-            user_id: UserId::from_bytes([1u8; 16]),
-            device_id: DeviceId::new(1),
+            id: Recipient::from_bytes_copy(&[1u8; 16]),
             identity_key: IdentityKey::from(sender_pub),
         };
 
@@ -345,7 +339,6 @@ mod tests {
         let recipient_pub = IdentityKey::from(PublicKey::from(&recipient_static));
 
         TestContext {
-            config,
             server_key,
             server_key_id,
             trust_root,
@@ -356,63 +349,61 @@ mod tests {
         }
     }
 
+    fn dummy_header() -> Vec<u8> {
+        crate::wire::build_header(&Recipient::from_bytes_copy(&[0u8; 16]), 0)
+    }
+
     #[test]
     fn seal_unseal_roundtrip() {
         let ctx = setup();
         let plaintext = b"hello MLS ciphertext";
+        let header = dummy_header();
 
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
         let envelope = seal(
-            &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             plaintext,
-            &routing_header,
+            &header,
         )
         .unwrap();
-        let (cert, inner) = unseal(
-            &ctx.config,
+        let (cert, inner): (SenderCertificate<Recipient>, _) = unseal(
             &ctx.recipient_static,
             &ctx.trust_root,
             Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
-            &routing_header,
+            &header,
         )
         .unwrap();
 
         assert_eq!(inner, plaintext);
-        assert_eq!(cert.user_id, UserId::from_bytes([1u8; 16]));
-        assert_eq!(cert.device_id, DeviceId::new(1));
+        assert_eq!(cert.sender_id, Recipient::from_bytes_copy(&[1u8; 16]));
     }
 
     #[test]
     fn wrong_recipient_key_fails() {
         let ctx = setup();
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let header = dummy_header();
         let envelope = seal(
-            &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"secret",
-            &routing_header,
+            &header,
         )
         .unwrap();
 
         let wrong_key = StaticSecret::random_from_rng(OsRng);
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
-        let result = unseal(
-            &ctx.config,
+        let result: Result<(SenderCertificate<Recipient>, _)> = unseal(
             &wrong_key,
             &ctx.trust_root,
             Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
-            &routing_header,
+            &header,
         );
 
         assert!(result.is_err());
@@ -421,30 +412,27 @@ mod tests {
     #[test]
     fn tampered_encrypted_static_fails() {
         let ctx = setup();
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let header = dummy_header();
         let envelope = seal(
-            &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"secret",
-            &routing_header,
+            &header,
         )
         .unwrap();
 
         let mut tampered_static = envelope.encrypted_static.clone();
         tampered_static[0] ^= 0xFF;
 
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
-        let result = unseal(
-            &ctx.config,
+        let result: Result<(SenderCertificate<Recipient>, _)> = unseal(
             &ctx.recipient_static,
             &ctx.trust_root,
             Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &tampered_static,
             &envelope.encrypted_message,
-            &routing_header,
+            &header,
         );
 
         assert!(matches!(result, Err(Error::UnsealFailed)));
@@ -453,30 +441,27 @@ mod tests {
     #[test]
     fn tampered_encrypted_message_fails() {
         let ctx = setup();
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let header = dummy_header();
         let envelope = seal(
-            &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"secret",
-            &routing_header,
+            &header,
         )
         .unwrap();
 
         let mut tampered_msg = envelope.encrypted_message.clone();
         tampered_msg[0] ^= 0xFF;
 
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
-        let result = unseal(
-            &ctx.config,
+        let result: Result<(SenderCertificate<Recipient>, _)> = unseal(
             &ctx.recipient_static,
             &ctx.trust_root,
             Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &tampered_msg,
-            &routing_header,
+            &header,
         );
 
         assert!(matches!(result, Err(Error::UnsealFailed)));
@@ -486,56 +471,52 @@ mod tests {
     fn ephemeral_key_is_fresh() {
         let ctx = setup();
         let plaintext = b"same message";
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let header = dummy_header();
 
-        let envelope1 = seal(
-            &ctx.config,
+        let e1 = seal(
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             plaintext,
-            &routing_header,
+            &header,
         )
         .unwrap();
 
-        let envelope2 = seal(
-            &ctx.config,
+        let e2 = seal(
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             plaintext,
-            &routing_header,
+            &header,
         )
         .unwrap();
 
-        assert_ne!(envelope1.ek_pub, envelope2.ek_pub);
-        assert_ne!(envelope1.encrypted_static, envelope2.encrypted_static);
-        assert_ne!(envelope1.encrypted_message, envelope2.encrypted_message);
+        assert_ne!(e1.ek_pub, e2.ek_pub);
+        assert_ne!(e1.encrypted_static, e2.encrypted_static);
+        assert_ne!(e1.encrypted_message, e2.encrypted_message);
     }
 
     #[test]
     fn empty_inner_ciphertext() {
         let ctx = setup();
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let header = dummy_header();
 
         let envelope = seal(
-            &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             b"",
-            &routing_header,
+            &header,
         )
         .unwrap();
-        let (_, inner) = unseal(
-            &ctx.config,
+        let (_, inner): (SenderCertificate<Recipient>, _) = unseal(
             &ctx.recipient_static,
             &ctx.trust_root,
             Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
-            &routing_header,
+            &header,
         )
         .unwrap();
 
@@ -546,26 +527,24 @@ mod tests {
     fn large_inner_ciphertext() {
         let ctx = setup();
         let large_payload = vec![0x42u8; 1_000_000];
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let header = dummy_header();
 
         let envelope = seal(
-            &ctx.config,
             &ctx.sender_static,
             &ctx.sender_cert,
             &ctx.recipient_pub,
             &large_payload,
-            &routing_header,
+            &header,
         )
         .unwrap();
-        let (_, inner) = unseal(
-            &ctx.config,
+        let (_, inner): (SenderCertificate<Recipient>, _) = unseal(
             &ctx.recipient_static,
             &ctx.trust_root,
             Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
-            &routing_header,
+            &header,
         )
         .unwrap();
 
@@ -574,18 +553,15 @@ mod tests {
 
     #[test]
     fn identity_key_mismatch_detected() {
-        let config = Config::default();
         let server_key = SigningKey::generate(&mut OsRng);
         let server_key_id = ServerKeyId::new(1);
         let trust_root = TrustRoot::new(server_key_id, server_key.verifying_key());
 
         let sender_static = StaticSecret::random_from_rng(OsRng);
 
-        // Issue cert with a DIFFERENT identity key than the sender's actual key
         let fake_identity = IdentityKey::from_bytes([0xAA; 32]);
         let sender_identity = SenderIdentity {
-            user_id: UserId::from_bytes([1u8; 16]),
-            device_id: DeviceId::new(1),
+            id: Recipient::from_bytes_copy(&[1u8; 16]),
             identity_key: fake_identity,
         };
         let bad_cert = issue_certificate(
@@ -599,28 +575,25 @@ mod tests {
         let recipient_static = StaticSecret::random_from_rng(OsRng);
         let recipient_pub = IdentityKey::from(PublicKey::from(&recipient_static));
 
-        let routing_header = [0u8; crate::wire::HEADER_LEN];
+        let header = dummy_header();
         let envelope = seal(
-            &config,
             &sender_static,
             &bad_cert,
             &recipient_pub,
             b"test",
-            &routing_header,
+            &header,
         )
         .unwrap();
-        let result = unseal(
-            &config,
+        let result: Result<(SenderCertificate<Recipient>, _)> = unseal(
             &recipient_static,
             &trust_root,
             Utc.timestamp_opt(0, 0).unwrap(),
             &envelope.ek_pub,
             &envelope.encrypted_static,
             &envelope.encrypted_message,
-            &routing_header,
+            &header,
         );
 
-        // The decrypted static key (sender_pub) won't match the cert's identity_key (fake_identity)
         assert!(matches!(result, Err(Error::IdentityKeyMismatch)));
     }
 }

@@ -2,24 +2,26 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::types::{DeviceId, IdentityKey, ServerKeyId, UserId};
+use crate::types::{IdentityKey, RecipientId, ServerKeyId};
 
 /// A sender's identity certificate, signed by the server.
 ///
-/// Binds a user + device to an [`IdentityKey`] with an expiry time.
+/// Binds a sender identity to an [`IdentityKey`] with an expiry time.
 /// Serialized with postcard inside the ECIES envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SenderCertificate {
-    pub user_id: UserId,
-    pub device_id: DeviceId,
+#[serde(bound(serialize = "R: Serialize", deserialize = "R: DeserializeOwned"))]
+pub struct SenderCertificate<R: RecipientId> {
+    pub sender_id: R,
     pub identity_key: IdentityKey,
     pub expires_at_secs: i64,
+    pub server_key_id: ServerKeyId,
 }
 
-impl SenderCertificate {
+impl<R: RecipientId> SenderCertificate<R> {
     /// Returns the certificate expiry as a `DateTime<Utc>`.
     pub fn expires_at(&self) -> DateTime<Utc> {
         DateTime::from_timestamp(self.expires_at_secs, 0).unwrap_or(DateTime::<Utc>::MAX_UTC)
@@ -31,13 +33,12 @@ impl SenderCertificate {
 /// Included inside the ECIES stage 2 payload so the recipient can verify
 /// the sender's identity after decryption.
 #[derive(Clone, Debug)]
-pub struct SignedSenderCertificate {
-    pub certificate: SenderCertificate,
+pub struct SignedSenderCertificate<R: RecipientId> {
+    pub certificate: SenderCertificate<R>,
     pub signature: [u8; 64],
-    pub server_key_id: ServerKeyId,
 }
 
-impl SignedSenderCertificate {
+impl<R: RecipientId> SignedSenderCertificate<R> {
     /// Serialize the inner certificate to postcard bytes (for signature verification).
     pub fn serialize_certificate(&self) -> Result<Vec<u8>> {
         postcard::to_allocvec(&self.certificate).map_err(|_| Error::Serialization)
@@ -59,43 +60,42 @@ mod sig_serde {
     }
 }
 
-impl Serialize for SignedSenderCertificate {
+impl<R: RecipientId> Serialize for SignedSenderCertificate<R> {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
         #[derive(Serialize)]
-        struct Helper<'a> {
-            certificate: &'a SenderCertificate,
+        #[serde(bound(serialize = "R: Serialize"))]
+        struct Helper<'a, R: RecipientId> {
+            certificate: &'a SenderCertificate<R>,
             #[serde(with = "sig_serde")]
             signature: &'a [u8; 64],
-            server_key_id: &'a ServerKeyId,
         }
         Helper {
             certificate: &self.certificate,
             signature: &self.signature,
-            server_key_id: &self.server_key_id,
         }
         .serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for SignedSenderCertificate {
+impl<'de, R: RecipientId> Deserialize<'de> for SignedSenderCertificate<R> {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         #[derive(Deserialize)]
-        struct Helper {
-            certificate: SenderCertificate,
+        #[serde(bound(deserialize = "R: DeserializeOwned"))]
+        struct Helper<R: RecipientId> {
+            #[serde(bound(deserialize = "R: DeserializeOwned"))]
+            certificate: SenderCertificate<R>,
             #[serde(with = "sig_serde")]
             signature: [u8; 64],
-            server_key_id: ServerKeyId,
         }
         let h = Helper::deserialize(deserializer)?;
         Ok(Self {
             certificate: h.certificate,
             signature: h.signature,
-            server_key_id: h.server_key_id,
         })
     }
 }
@@ -127,9 +127,9 @@ impl TrustRoot {
     }
 
     /// Verify the Ed25519 signature on a signed sender certificate.
-    pub fn verify(&self, cert: &SignedSenderCertificate) -> Result<()> {
+    pub fn verify<R: RecipientId>(&self, cert: &SignedSenderCertificate<R>) -> Result<()> {
         let verifying_key = self
-            .get_key(cert.server_key_id)
+            .get_key(cert.certificate.server_key_id)
             .ok_or(Error::UnknownServerKey)?;
 
         let cert_bytes =
@@ -147,17 +147,17 @@ impl TrustRoot {
 ///
 /// The server signs the certificate with its Ed25519 key. Clients include
 /// the resulting [`SignedSenderCertificate`] in every sealed message.
-pub fn issue_certificate(
+pub fn issue_certificate<R: RecipientId>(
     server_signing_key: &SigningKey,
     server_key_id: ServerKeyId,
-    sender: &crate::types::SenderIdentity,
+    sender: &crate::types::SenderIdentity<R>,
     expires_at: DateTime<Utc>,
-) -> Result<SignedSenderCertificate> {
+) -> Result<SignedSenderCertificate<R>> {
     let certificate = SenderCertificate {
-        user_id: sender.user_id,
-        device_id: sender.device_id,
+        sender_id: sender.id.clone(),
         identity_key: sender.identity_key,
         expires_at_secs: expires_at.timestamp(),
+        server_key_id,
     };
 
     let cert_bytes = postcard::to_allocvec(&certificate).map_err(|_| Error::Serialization)?;
@@ -166,14 +166,13 @@ pub fn issue_certificate(
     Ok(SignedSenderCertificate {
         certificate,
         signature: signature.to_bytes(),
-        server_key_id,
     })
 }
 
 /// Verify a sender certificate's signature and check that it has not expired.
-pub fn verify_certificate(
+pub fn verify_certificate<R: RecipientId>(
     trust_root: &TrustRoot,
-    cert: &SignedSenderCertificate,
+    cert: &SignedSenderCertificate<R>,
     now: DateTime<Utc>,
 ) -> Result<()> {
     trust_root.verify(cert)?;
@@ -188,19 +187,23 @@ pub fn verify_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::SenderIdentity;
+    use crate::types::{Recipient, SenderIdentity};
     use chrono::TimeZone;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
 
-    fn test_fixtures() -> (SigningKey, ServerKeyId, SenderIdentity, TrustRoot) {
+    fn test_fixtures() -> (
+        SigningKey,
+        ServerKeyId,
+        SenderIdentity<Recipient>,
+        TrustRoot,
+    ) {
         let server_key = SigningKey::generate(&mut OsRng);
         let server_key_id = ServerKeyId::new(1);
         let trust_root = TrustRoot::new(server_key_id, server_key.verifying_key());
 
         let sender = SenderIdentity {
-            user_id: UserId::from_bytes([1u8; 16]),
-            device_id: DeviceId::new(42),
+            id: Recipient::from_bytes_copy(&[1u8; 16]),
             identity_key: IdentityKey::from_bytes([2u8; 32]),
         };
 
@@ -214,8 +217,7 @@ mod tests {
 
         let cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
 
-        assert_eq!(cert.certificate.user_id, sender.user_id);
-        assert_eq!(cert.certificate.device_id, sender.device_id);
+        assert_eq!(cert.certificate.sender_id, sender.id);
         assert_eq!(cert.certificate.identity_key, sender.identity_key);
 
         let now = Utc.timestamp_opt(1000, 0).unwrap();
@@ -269,7 +271,7 @@ mod tests {
         let expires = DateTime::<Utc>::MAX_UTC;
 
         let mut cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
-        cert.server_key_id = ServerKeyId::new(999);
+        cert.certificate.server_key_id = ServerKeyId::new(999);
 
         let now = Utc.timestamp_opt(0, 0).unwrap();
         let err = verify_certificate(&trust_root, &cert, now).unwrap_err();
@@ -282,7 +284,7 @@ mod tests {
         let expires = DateTime::<Utc>::MAX_UTC;
 
         let mut cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
-        cert.certificate.user_id = UserId::from_bytes([0xFF; 16]);
+        cert.certificate.sender_id = Recipient::from_bytes_copy(&[0xFF; 16]);
 
         let now = Utc.timestamp_opt(0, 0).unwrap();
         let err = verify_certificate(&trust_root, &cert, now).unwrap_err();
@@ -312,8 +314,7 @@ mod tests {
         trust_root.add_key(key_id_2, server_key_2.verifying_key());
 
         let sender = SenderIdentity {
-            user_id: UserId::from_bytes([1u8; 16]),
-            device_id: DeviceId::new(1),
+            id: Recipient::from_bytes_copy(&[1u8; 16]),
             identity_key: IdentityKey::from_bytes([2u8; 32]),
         };
         let expires = DateTime::<Utc>::MAX_UTC;

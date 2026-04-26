@@ -1,50 +1,52 @@
 use crate::error::{Error, Result};
 use crate::sealed_sender::SealedEnvelope;
-use crate::types::{DeviceId, UserId};
+use crate::types::RecipientId;
 
 /// Current wire format version.
 pub const VERSION: u8 = 0x01;
 
-/// Size of the version field in bytes.
 pub const VERSION_LEN: usize = 1;
-/// Size of the user ID field in bytes.
-pub const USER_ID_LEN: usize = 16;
-/// Size of the device ID field in bytes.
-pub const DEVICE_ID_LEN: usize = 4;
-/// Size of the ephemeral public key field in bytes.
+pub const RECIPIENT_LEN_LEN: usize = 2;
+pub const MESSAGE_SEQ_LEN: usize = 8;
 pub const EK_PUB_LEN: usize = 32;
-/// Size of the encrypted static key field (32 ciphertext + 16 Poly1305 tag).
 pub const ENCRYPTED_STATIC_LEN: usize = 48;
 
-/// Size of the routing header (version + user ID + device ID).
-pub const HEADER_LEN: usize = VERSION_LEN + USER_ID_LEN + DEVICE_ID_LEN;
-/// Minimum valid wire message size (header + ephemeral key + encrypted static).
-pub const MIN_MESSAGE_LEN: usize = HEADER_LEN + EK_PUB_LEN + ENCRYPTED_STATIC_LEN;
+/// Minimum bytes before the variable-length recipient ID.
+pub const MIN_FIXED_OVERHEAD: usize =
+    VERSION_LEN + RECIPIENT_LEN_LEN + MESSAGE_SEQ_LEN + EK_PUB_LEN + ENCRYPTED_STATIC_LEN;
 
 /// A parsed sealed sender wire message with zero-copy references into the input bytes.
 #[derive(Debug)]
-pub struct DecodedMessage<'a> {
-    pub recipient_id: UserId,
-    pub recipient_device_id: DeviceId,
+pub struct DecodedMessage<'a, R: RecipientId> {
+    pub recipient_id: R,
+    pub message_sequence: u64,
+    pub header_len: usize,
     pub ek_pub: [u8; 32],
     pub encrypted_static: &'a [u8],
     pub encrypted_message: &'a [u8],
 }
 
-/// Build the routing header bytes (version + recipient ID + device ID).
-pub fn build_header(recipient_id: UserId, recipient_device_id: DeviceId) -> [u8; HEADER_LEN] {
-    let mut header = [0u8; HEADER_LEN];
-    header[0] = VERSION;
-    header[VERSION_LEN..VERSION_LEN + USER_ID_LEN].copy_from_slice(recipient_id.as_bytes());
-    header[VERSION_LEN + USER_ID_LEN..HEADER_LEN]
-        .copy_from_slice(&recipient_device_id.as_u32().to_le_bytes());
+/// Build the routing header bytes.
+///
+/// Layout: `version(1) | recipient_len(2 LE) | recipient_bytes(N) | message_sequence(8 LE)`
+pub fn build_header<R: RecipientId>(
+    recipient_id: &R,
+    message_sequence: u64,
+) -> Vec<u8> {
+    let id_bytes = recipient_id.to_bytes();
+    let mut header =
+        Vec::with_capacity(VERSION_LEN + RECIPIENT_LEN_LEN + id_bytes.len() + MESSAGE_SEQ_LEN);
+    header.push(VERSION);
+    header.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+    header.extend_from_slice(id_bytes);
+    header.extend_from_slice(&message_sequence.to_le_bytes());
     header
 }
 
 /// Encode a sealed envelope with a pre-built routing header into wire-format bytes.
-pub fn encode_with_header(header: &[u8; HEADER_LEN], envelope: &SealedEnvelope) -> Vec<u8> {
+pub fn encode_with_header(header: &[u8], envelope: &SealedEnvelope) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        HEADER_LEN
+        header.len()
             + EK_PUB_LEN
             + envelope.encrypted_static.len()
             + envelope.encrypted_message.len(),
@@ -59,18 +61,18 @@ pub fn encode_with_header(header: &[u8; HEADER_LEN], envelope: &SealedEnvelope) 
 }
 
 /// Encode a sealed envelope into wire-format bytes.
-pub fn encode(
-    recipient_id: UserId,
-    recipient_device_id: DeviceId,
+pub fn encode<R: RecipientId>(
+    recipient_id: &R,
+    message_sequence: u64,
     envelope: &SealedEnvelope,
 ) -> Vec<u8> {
-    let header = build_header(recipient_id, recipient_device_id);
+    let header = build_header(recipient_id, message_sequence);
     encode_with_header(&header, envelope)
 }
 
 /// Parse wire-format bytes into a [`DecodedMessage`] with zero-copy field references.
-pub fn decode(bytes: &[u8]) -> Result<DecodedMessage<'_>> {
-    if bytes.len() < MIN_MESSAGE_LEN {
+pub fn decode<R: RecipientId>(bytes: &[u8]) -> Result<DecodedMessage<'_, R>> {
+    if bytes.len() < MIN_FIXED_OVERHEAD {
         return Err(Error::MessageTooShort);
     }
 
@@ -81,12 +83,22 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage<'_>> {
 
     let mut offset = VERSION_LEN;
 
-    let mut recipient_id_bytes = [0u8; 16];
-    recipient_id_bytes.copy_from_slice(&bytes[offset..offset + USER_ID_LEN]);
-    offset += USER_ID_LEN;
+    let id_len =
+        u16::from_le_bytes(bytes[offset..offset + RECIPIENT_LEN_LEN].try_into().unwrap()) as usize;
+    offset += RECIPIENT_LEN_LEN;
 
-    let device_id = u32::from_le_bytes(bytes[offset..offset + DEVICE_ID_LEN].try_into().unwrap());
-    offset += DEVICE_ID_LEN;
+    if bytes.len() < offset + id_len + MESSAGE_SEQ_LEN + EK_PUB_LEN + ENCRYPTED_STATIC_LEN {
+        return Err(Error::MessageTooShort);
+    }
+
+    let recipient_id = R::from_bytes(&bytes[offset..offset + id_len])?;
+    offset += id_len;
+
+    let message_sequence =
+        u64::from_le_bytes(bytes[offset..offset + MESSAGE_SEQ_LEN].try_into().unwrap());
+    offset += MESSAGE_SEQ_LEN;
+
+    let header_len = offset;
 
     let mut ek_pub = [0u8; 32];
     ek_pub.copy_from_slice(&bytes[offset..offset + EK_PUB_LEN]);
@@ -98,8 +110,9 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage<'_>> {
     let encrypted_message = &bytes[offset..];
 
     Ok(DecodedMessage {
-        recipient_id: UserId::from_bytes(recipient_id_bytes),
-        recipient_device_id: DeviceId::new(device_id),
+        recipient_id,
+        message_sequence,
+        header_len,
         ek_pub,
         encrypted_static,
         encrypted_message,
@@ -109,6 +122,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Recipient;
 
     fn test_envelope() -> SealedEnvelope {
         SealedEnvelope {
@@ -118,17 +132,21 @@ mod tests {
         }
     }
 
+    fn rid(b: u8) -> Recipient {
+        Recipient::from_bytes_copy(&[b; 16])
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
-        let recipient_id = UserId::from_bytes([1u8; 16]);
-        let device_id = DeviceId::new(42);
+        let recipient = rid(0x42);
+        let seq = 7u64;
         let envelope = test_envelope();
 
-        let wire = encode(recipient_id, device_id, &envelope);
-        let decoded = decode(&wire).unwrap();
+        let wire = encode(&recipient, seq, &envelope);
+        let decoded: DecodedMessage<Recipient> = decode(&wire).unwrap();
 
-        assert_eq!(decoded.recipient_id, recipient_id);
-        assert_eq!(decoded.recipient_device_id, device_id);
+        assert_eq!(decoded.recipient_id, recipient);
+        assert_eq!(decoded.message_sequence, seq);
         assert_eq!(decoded.ek_pub, [0xAA; 32]);
         assert_eq!(decoded.encrypted_static, &[0xBB; ENCRYPTED_STATIC_LEN]);
         assert_eq!(decoded.encrypted_message, &[0xCC; 100]);
@@ -136,46 +154,49 @@ mod tests {
 
     #[test]
     fn version_byte_is_first() {
-        let wire = encode(
-            UserId::from_bytes([0; 16]),
-            DeviceId::new(0),
-            &test_envelope(),
-        );
+        let wire = encode(&rid(0), 0, &test_envelope());
         assert_eq!(wire[0], VERSION);
     }
 
     #[test]
     fn byte_layout_matches_spec() {
-        let recipient_id = UserId::from_bytes([0x11; 16]);
-        let device_id = DeviceId::new(0x04030201);
+        let recipient = Recipient::from_bytes_copy(&[0x22; 16]);
+        let seq: u64 = 0x0807060504030201;
         let envelope = test_envelope();
 
-        let wire = encode(recipient_id, device_id, &envelope);
+        let wire = encode(&recipient, seq, &envelope);
 
-        assert_eq!(wire[0], 0x01); // version
-        assert_eq!(&wire[1..17], &[0x11; 16]); // recipient_id
-        assert_eq!(&wire[17..21], &[0x01, 0x02, 0x03, 0x04]); // device_id LE
-        assert_eq!(&wire[21..53], &[0xAA; 32]); // ek_pub
-        assert_eq!(&wire[53..101], &[0xBB; 48]); // encrypted_static
-        assert_eq!(&wire[101..], &[0xCC; 100]); // encrypted_message
+        let mut offset = 0;
+        assert_eq!(wire[offset], 0x01); // version
+        offset += 1;
+        assert_eq!(&wire[offset..offset + 2], &16u16.to_le_bytes()); // recipient len
+        offset += 2;
+        assert_eq!(&wire[offset..offset + 16], &[0x22; 16]); // recipient bytes
+        offset += 16;
+        assert_eq!(
+            &wire[offset..offset + 8],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        ); // message_sequence LE
+        offset += 8;
+        assert_eq!(&wire[offset..offset + 32], &[0xAA; 32]); // ek_pub
+        offset += 32;
+        assert_eq!(&wire[offset..offset + 48], &[0xBB; 48]); // encrypted_static
+        offset += 48;
+        assert_eq!(&wire[offset..], &[0xCC; 100]); // encrypted_message
     }
 
     #[test]
     fn rejects_truncated_input() {
-        let wire = vec![0u8; MIN_MESSAGE_LEN - 1];
-        let err = decode(&wire).unwrap_err();
+        let wire = vec![0u8; MIN_FIXED_OVERHEAD - 1];
+        let err = decode::<Recipient>(&wire).unwrap_err();
         assert!(matches!(err, Error::MessageTooShort));
     }
 
     #[test]
     fn rejects_wrong_version() {
-        let mut wire = encode(
-            UserId::from_bytes([0; 16]),
-            DeviceId::new(0),
-            &test_envelope(),
-        );
+        let mut wire = encode(&rid(0), 0, &test_envelope());
         wire[0] = 0x99;
-        let err = decode(&wire).unwrap_err();
+        let err = decode::<Recipient>(&wire).unwrap_err();
         assert!(matches!(err, Error::UnknownVersion(0x99)));
     }
 
@@ -186,8 +207,25 @@ mod tests {
             encrypted_static: vec![0; ENCRYPTED_STATIC_LEN],
             encrypted_message: vec![],
         };
-        let wire = encode(UserId::from_bytes([0; 16]), DeviceId::new(0), &envelope);
-        assert_eq!(wire.len(), MIN_MESSAGE_LEN);
-        decode(&wire).unwrap();
+        let wire = encode(&rid(0), 0, &envelope);
+        decode::<Recipient>(&wire).unwrap();
+    }
+
+    #[test]
+    fn variable_length_recipient_id() {
+        let short_id = Recipient::from_bytes_copy(&[0xAA; 4]);
+        let long_id = Recipient::from_bytes_copy(&[0xBB; 64]);
+        let envelope = test_envelope();
+
+        let wire_short = encode(&short_id, 1, &envelope);
+        let wire_long = encode(&long_id, 1, &envelope);
+
+        assert!(wire_long.len() > wire_short.len());
+
+        let decoded_short: DecodedMessage<Recipient> = decode(&wire_short).unwrap();
+        let decoded_long: DecodedMessage<Recipient> = decode(&wire_long).unwrap();
+
+        assert_eq!(decoded_short.recipient_id, short_id);
+        assert_eq!(decoded_long.recipient_id, long_id);
     }
 }
