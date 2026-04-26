@@ -1,29 +1,29 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
-pub mod certificate;
-pub mod error;
-pub mod replay;
-pub mod sealed_sender;
-pub mod types;
-pub mod wire;
+pub(crate) mod certificate;
+pub(crate) mod error;
+pub(crate) mod replay;
+pub(crate) mod sealed_sender;
+pub(crate) mod types;
+pub(crate) mod wire;
 
 pub use certificate::{
     SenderCertificate, SignedSenderCertificate, TrustRoot, issue_certificate, verify_certificate,
 };
-pub use error::{Error, Result};
+pub use error::Error;
 pub use replay::ReplayFilter;
-pub use types::{IdentityKey, Recipient, RecipientId, SenderIdentity, ServerKeyId};
+pub use types::{IdentityKey, Recipient, RecipientId, SenderIdentity, SigningKeyId};
 
 use chrono::{DateTime, Utc};
 use x25519_dalek::StaticSecret;
 
 /// Seal an inner ciphertext for delivery to a specific recipient.
 ///
-/// Produces wire-format bytes that hide the sender's identity from the relay
-/// server. The recipient can unseal the message and recover the sender's
+/// Produces wire-format bytes that hide the sender's identity from the
+/// relay. The recipient can unseal the message and recover the sender's
 /// verified identity.
-#[must_use = "sealed message bytes must be sent to the recipient"]
 pub fn seal_message<R: RecipientId>(
     sender_identity: &StaticSecret,
     sender_cert: &SignedSenderCertificate<R>,
@@ -31,7 +31,7 @@ pub fn seal_message<R: RecipientId>(
     message_sequence: u64,
     recipient_identity_public: &IdentityKey,
     inner_ciphertext: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, Error> {
     let routing_header = wire::build_header(recipient_id, message_sequence);
 
     let envelope = sealed_sender::seal(
@@ -64,7 +64,7 @@ pub fn unseal_message<R: RecipientId>(
     trust_root: &TrustRoot,
     now: DateTime<Utc>,
     wire_bytes: &[u8],
-) -> Result<(SenderCertificate<R>, u64, Vec<u8>)> {
+) -> Result<(SenderCertificate<R>, u64, Vec<u8>), Error> {
     let msg: wire::DecodedMessage<'_, R> = wire::decode(wire_bytes)?;
 
     let (cert, inner) = sealed_sender::unseal(
@@ -91,7 +91,7 @@ pub fn unseal_with_replay_check<R: RecipientId>(
     now: DateTime<Utc>,
     wire_bytes: &[u8],
     replay_filter: &mut ReplayFilter<R>,
-) -> Result<(SenderCertificate<R>, u64, Vec<u8>)> {
+) -> Result<(SenderCertificate<R>, u64, Vec<u8>), Error> {
     let (cert, seq, inner) = unseal_message::<R>(recipient_identity, trust_root, now, wire_bytes)?;
 
     if !replay_filter.check(cert.sender_id.clone(), seq) {

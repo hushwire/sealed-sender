@@ -2,11 +2,13 @@
 name = "sealed-sender"
 version = "0.1.0"
 edition = "2024"
-description = "Sealed sender for MLS: server-side sender anonymity via two-stage ECIES"
+rust-version = "1.85"
+description = "Sealed sender for MLS: sender anonymity via two-stage ECIES"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/hushwire/sealed-sender"
 keywords = ["mls", "sealed-sender", "ecies", "e2ee", "privacy"]
-categories = ["cryptography", "no-std"]
+categories = ["cryptography"]
+exclude = ["Cargo.lock"]
 authors = ["rob@hushwire.io"]
 
 [dependencies]

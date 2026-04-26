@@ -1,7 +1,6 @@
 use thiserror::Error;
 
-/// Alias for `Result<T, sealed_sender::Error>`.
-pub type Result<T> = core::result::Result<T, Error>;
+pub(crate) type Result<T> = core::result::Result<T, Error>;
 
 /// Errors returned by sealed sender operations.
 #[derive(Debug, Error)]
@@ -18,9 +17,9 @@ pub enum Error {
     #[error("certificate expired")]
     CertificateExpired,
 
-    /// The `ServerKeyId` in the certificate does not match any key in the [`TrustRoot`](crate::TrustRoot).
-    #[error("unknown server key ID")]
-    UnknownServerKey,
+    /// The `SigningKeyId` in the certificate does not match any key in the [`TrustRoot`](crate::TrustRoot).
+    #[error("unknown signing key ID")]
+    UnknownSigningKey,
 
     /// The ECIES-decrypted static key does not match the certificate's claimed identity key.
     #[error("identity key mismatch")]

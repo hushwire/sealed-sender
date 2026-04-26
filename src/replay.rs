@@ -22,6 +22,7 @@ pub struct ReplayFilter<R: RecipientId> {
 }
 
 impl<R: RecipientId> ReplayFilter<R> {
+    /// Create an empty replay filter.
     pub fn new() -> Self {
         Self {
             state: HashMap::new(),

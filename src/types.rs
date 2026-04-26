@@ -19,7 +19,9 @@ use crate::error::Error;
 pub trait RecipientId:
     Clone + Eq + std::hash::Hash + Serialize + DeserializeOwned + std::fmt::Debug
 {
+    /// Serialize this identity to bytes for the wire format.
     fn to_bytes(&self) -> &[u8];
+    /// Deserialize an identity from bytes.
     fn from_bytes(bytes: &[u8]) -> Result<Self>;
 }
 
@@ -32,10 +34,12 @@ pub trait RecipientId:
 pub struct Recipient(Vec<u8>);
 
 impl Recipient {
+    /// Create a recipient from an owned byte vector.
     pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
 
+    /// Create a recipient by copying a byte slice.
     pub fn from_bytes_copy(bytes: &[u8]) -> Self {
         Self(bytes.to_vec())
     }
@@ -74,10 +78,12 @@ impl TryFrom<Recipient> for uuid::Uuid {
 pub struct IdentityKey([u8; 32]);
 
 impl IdentityKey {
+    /// Wrap raw key bytes.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
+    /// Return the raw key bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -125,28 +131,32 @@ impl TryFrom<&mls_rs_core::crypto::HpkePublicKey> for IdentityKey {
 #[cfg(feature = "mls-rs")]
 impl From<IdentityKey> for mls_rs_core::crypto::HpkePublicKey {
     fn from(key: IdentityKey) -> Self {
-        mls_rs_core::crypto::HpkePublicKey::new(key.0.to_vec())
+        key.0.to_vec().into()
     }
 }
 
-/// Identifies which server Ed25519 signing key issued a certificate.
-///
-/// Supports key rotation: the [`TrustRoot`](crate::TrustRoot) maps `ServerKeyId` to public keys.
+/// Identifies which Ed25519 signing key issued a certificate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct ServerKeyId(u32);
+pub struct SigningKeyId(u32);
 
-impl ServerKeyId {
+impl SigningKeyId {
+    /// Create a key ID from a `u32`.
     pub fn new(id: u32) -> Self {
         Self(id)
     }
 
+    /// Return the underlying `u32`.
     pub fn as_u32(&self) -> u32 {
         self.0
     }
 }
 
 /// The sender's identity fields needed to issue a [`SenderCertificate`](crate::SenderCertificate).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(serialize = "R: Serialize", deserialize = "R: DeserializeOwned"))]
 pub struct SenderIdentity<R: RecipientId> {
+    /// The sender's application-level identifier.
     pub id: R,
+    /// The sender's long-term X25519 identity key.
     pub identity_key: IdentityKey,
 }
