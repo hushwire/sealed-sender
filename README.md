@@ -1,9 +1,8 @@
 # sealed-sender
 
-Sealed sender for MLS. Provides server-side sender anonymity by wrapping
-encrypted ciphertext in a two-stage ECIES envelope (mirroring Signal's sealed
-sender protocol). The server sees only the recipient; the recipient recovers
-the sender's verified identity.
+Sealed sender for MLS. Provides sender anonymity by wrapping encrypted
+ciphertext in a two-stage ECIES envelope. The relay sees only the
+recipient; the recipient recovers the sender's verified identity.
 
 ## How it works
 
@@ -16,7 +15,7 @@ message) in a two-layer ECIES envelope:
    with the recipient, chained from stage 1 via HKDF. This encrypts the sender
    certificate and inner ciphertext.
 
-The server routes the message using the plaintext routing header
+The relay routes the message using the plaintext routing header
 (recipient ID) but cannot see who sent it. The recipient decrypts both layers,
 verifies the sender's Ed25519-signed certificate, and recovers the inner
 ciphertext.
@@ -33,13 +32,13 @@ use the provided `Recipient` opaque byte wrapper.
 ```rust,ignore
 use sealed_sender::{
     seal_message, unseal_with_replay_check, issue_certificate,
-    Recipient, IdentityKey, ServerKeyId,
+    Recipient, IdentityKey, SigningKeyId,
     SenderIdentity, TrustRoot, ReplayFilter,
 };
 
-// Server issues a sender certificate
+// Issuer creates a sender certificate
 let cert = issue_certificate(
-    &server_signing_key, server_key_id, &sender_identity, expires_at,
+    &signing_key, signing_key_id, &sender_identity, expires_at,
 ).unwrap();
 
 // Sender seals a message
@@ -63,6 +62,10 @@ let (sender_cert, seq, inner) = unseal_with_replay_check(
 |------|---------|-------------|
 | `uuid` | off | `From` conversions between `Recipient` and `uuid::Uuid` |
 | `mls-rs` | off | `TryFrom` conversions between `IdentityKey` and `mls_rs_core::crypto::HpkePublicKey` |
+
+## Minimum Rust version
+
+1.85 (edition 2024).
 
 ## Security
 
