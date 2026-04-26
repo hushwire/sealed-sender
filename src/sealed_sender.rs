@@ -298,16 +298,14 @@ pub fn unseal<R: RecipientId>(
 mod tests {
     use super::*;
     use crate::certificate::issue_certificate;
-    use crate::types::{Recipient, SenderIdentity, ServerKeyId};
+    use crate::types::{Recipient, SenderIdentity, SigningKeyId};
     use chrono::TimeZone;
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
 
     struct TestContext {
-        #[allow(dead_code)]
-        server_key: SigningKey,
-        #[allow(dead_code)]
-        server_key_id: ServerKeyId,
+        _issuer_key: SigningKey,
+        _signing_key_id: SigningKeyId,
         trust_root: TrustRoot,
         sender_static: StaticSecret,
         sender_cert: SignedSenderCertificate<Recipient>,
@@ -316,9 +314,9 @@ mod tests {
     }
 
     fn setup() -> TestContext {
-        let server_key = SigningKey::generate(&mut OsRng);
-        let server_key_id = ServerKeyId::new(1);
-        let trust_root = TrustRoot::new(server_key_id, server_key.verifying_key());
+        let issuer_key = SigningKey::generate(&mut OsRng);
+        let signing_key_id = SigningKeyId::new(1);
+        let trust_root = TrustRoot::new(signing_key_id, issuer_key.verifying_key());
 
         let sender_static = StaticSecret::random_from_rng(OsRng);
         let sender_pub = PublicKey::from(&sender_static);
@@ -328,8 +326,8 @@ mod tests {
         };
 
         let sender_cert = issue_certificate(
-            &server_key,
-            server_key_id,
+            &issuer_key,
+            signing_key_id,
             &sender_identity,
             DateTime::<Utc>::MAX_UTC,
         )
@@ -339,8 +337,8 @@ mod tests {
         let recipient_pub = IdentityKey::from(PublicKey::from(&recipient_static));
 
         TestContext {
-            server_key,
-            server_key_id,
+            _issuer_key: issuer_key,
+            _signing_key_id: signing_key_id,
             trust_root,
             sender_static,
             sender_cert,
@@ -553,9 +551,9 @@ mod tests {
 
     #[test]
     fn identity_key_mismatch_detected() {
-        let server_key = SigningKey::generate(&mut OsRng);
-        let server_key_id = ServerKeyId::new(1);
-        let trust_root = TrustRoot::new(server_key_id, server_key.verifying_key());
+        let issuer_key = SigningKey::generate(&mut OsRng);
+        let signing_key_id = SigningKeyId::new(1);
+        let trust_root = TrustRoot::new(signing_key_id, issuer_key.verifying_key());
 
         let sender_static = StaticSecret::random_from_rng(OsRng);
 
@@ -565,8 +563,8 @@ mod tests {
             identity_key: fake_identity,
         };
         let bad_cert = issue_certificate(
-            &server_key,
-            server_key_id,
+            &issuer_key,
+            signing_key_id,
             &sender_identity,
             DateTime::<Utc>::MAX_UTC,
         )
@@ -576,14 +574,7 @@ mod tests {
         let recipient_pub = IdentityKey::from(PublicKey::from(&recipient_static));
 
         let header = dummy_header();
-        let envelope = seal(
-            &sender_static,
-            &bad_cert,
-            &recipient_pub,
-            b"test",
-            &header,
-        )
-        .unwrap();
+        let envelope = seal(&sender_static, &bad_cert, &recipient_pub, b"test", &header).unwrap();
         let result: Result<(SenderCertificate<Recipient>, _)> = unseal(
             &recipient_static,
             &trust_root,

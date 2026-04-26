@@ -17,6 +17,7 @@ pub const MIN_FIXED_OVERHEAD: usize =
 
 /// A parsed sealed sender wire message with zero-copy references into the input bytes.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct DecodedMessage<'a, R: RecipientId> {
     pub recipient_id: R,
     pub message_sequence: u64,
@@ -29,10 +30,7 @@ pub struct DecodedMessage<'a, R: RecipientId> {
 /// Build the routing header bytes.
 ///
 /// Layout: `version(1) | recipient_len(2 LE) | recipient_bytes(N) | message_sequence(8 LE)`
-pub fn build_header<R: RecipientId>(
-    recipient_id: &R,
-    message_sequence: u64,
-) -> Vec<u8> {
+pub fn build_header<R: RecipientId>(recipient_id: &R, message_sequence: u64) -> Vec<u8> {
     let id_bytes = recipient_id.to_bytes();
     let mut header =
         Vec::with_capacity(VERSION_LEN + RECIPIENT_LEN_LEN + id_bytes.len() + MESSAGE_SEQ_LEN);
@@ -60,7 +58,7 @@ pub fn encode_with_header(header: &[u8], envelope: &SealedEnvelope) -> Vec<u8> {
     out
 }
 
-/// Encode a sealed envelope into wire-format bytes.
+#[cfg(test)]
 pub fn encode<R: RecipientId>(
     recipient_id: &R,
     message_sequence: u64,
@@ -83,8 +81,11 @@ pub fn decode<R: RecipientId>(bytes: &[u8]) -> Result<DecodedMessage<'_, R>> {
 
     let mut offset = VERSION_LEN;
 
-    let id_len =
-        u16::from_le_bytes(bytes[offset..offset + RECIPIENT_LEN_LEN].try_into().unwrap()) as usize;
+    let id_len = u16::from_le_bytes(
+        bytes[offset..offset + RECIPIENT_LEN_LEN]
+            .try_into()
+            .map_err(|_| Error::MessageTooShort)?,
+    ) as usize;
     offset += RECIPIENT_LEN_LEN;
 
     if bytes.len() < offset + id_len + MESSAGE_SEQ_LEN + EK_PUB_LEN + ENCRYPTED_STATIC_LEN {
@@ -94,8 +95,11 @@ pub fn decode<R: RecipientId>(bytes: &[u8]) -> Result<DecodedMessage<'_, R>> {
     let recipient_id = R::from_bytes(&bytes[offset..offset + id_len])?;
     offset += id_len;
 
-    let message_sequence =
-        u64::from_le_bytes(bytes[offset..offset + MESSAGE_SEQ_LEN].try_into().unwrap());
+    let message_sequence = u64::from_le_bytes(
+        bytes[offset..offset + MESSAGE_SEQ_LEN]
+            .try_into()
+            .map_err(|_| Error::MessageTooShort)?,
+    );
     offset += MESSAGE_SEQ_LEN;
 
     let header_len = offset;

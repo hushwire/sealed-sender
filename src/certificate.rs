@@ -6,19 +6,23 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::types::{IdentityKey, RecipientId, ServerKeyId};
+use crate::types::{IdentityKey, RecipientId, SigningKeyId};
 
-/// A sender's identity certificate, signed by the server.
+/// A sender's identity certificate, signed by a trusted issuer.
 ///
 /// Binds a sender identity to an [`IdentityKey`] with an expiry time.
 /// Serialized with postcard inside the ECIES envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(bound(serialize = "R: Serialize", deserialize = "R: DeserializeOwned"))]
 pub struct SenderCertificate<R: RecipientId> {
+    /// The sender's application-level identifier.
     pub sender_id: R,
+    /// The sender's long-term X25519 identity key.
     pub identity_key: IdentityKey,
+    /// Certificate expiry as a Unix timestamp (seconds since epoch).
     pub expires_at_secs: i64,
-    pub server_key_id: ServerKeyId,
+    /// Which signing key issued this certificate.
+    pub signing_key_id: SigningKeyId,
 }
 
 impl<R: RecipientId> SenderCertificate<R> {
@@ -28,13 +32,15 @@ impl<R: RecipientId> SenderCertificate<R> {
     }
 }
 
-/// A [`SenderCertificate`] with an Ed25519 signature from the server.
+/// A [`SenderCertificate`] with an Ed25519 signature from the issuer.
 ///
 /// Included inside the ECIES stage 2 payload so the recipient can verify
 /// the sender's identity after decryption.
 #[derive(Clone, Debug)]
 pub struct SignedSenderCertificate<R: RecipientId> {
+    /// The underlying certificate.
     pub certificate: SenderCertificate<R>,
+    /// Ed25519 signature over the serialized certificate.
     pub signature: [u8; 64],
 }
 
@@ -100,37 +106,38 @@ impl<'de, R: RecipientId> Deserialize<'de> for SignedSenderCertificate<R> {
     }
 }
 
-/// A set of trusted server Ed25519 public keys, keyed by [`ServerKeyId`].
+/// A set of trusted Ed25519 public keys, keyed by [`SigningKeyId`].
 ///
 /// Recipients use this to verify sender certificates. Supports key rotation
 /// by holding multiple keys simultaneously.
+#[derive(Clone, Debug)]
 pub struct TrustRoot {
-    keys: BTreeMap<ServerKeyId, VerifyingKey>,
+    keys: BTreeMap<SigningKeyId, VerifyingKey>,
 }
 
 impl TrustRoot {
-    /// Create a trust root with a single server key.
-    pub fn new(key_id: ServerKeyId, public_key: VerifyingKey) -> Self {
+    /// Create a trust root with a single signing key.
+    pub fn new(key_id: SigningKeyId, public_key: VerifyingKey) -> Self {
         let mut keys = BTreeMap::new();
         keys.insert(key_id, public_key);
         Self { keys }
     }
 
-    /// Add (or replace) a server key for rotation.
-    pub fn add_key(&mut self, key_id: ServerKeyId, public_key: VerifyingKey) {
+    /// Add (or replace) a signing key for rotation.
+    pub fn add_key(&mut self, key_id: SigningKeyId, public_key: VerifyingKey) {
         self.keys.insert(key_id, public_key);
     }
 
-    /// Look up a server key by ID.
-    pub fn get_key(&self, key_id: ServerKeyId) -> Option<&VerifyingKey> {
+    /// Look up a signing key by ID.
+    pub fn get_key(&self, key_id: SigningKeyId) -> Option<&VerifyingKey> {
         self.keys.get(&key_id)
     }
 
     /// Verify the Ed25519 signature on a signed sender certificate.
     pub fn verify<R: RecipientId>(&self, cert: &SignedSenderCertificate<R>) -> Result<()> {
         let verifying_key = self
-            .get_key(cert.certificate.server_key_id)
-            .ok_or(Error::UnknownServerKey)?;
+            .get_key(cert.certificate.signing_key_id)
+            .ok_or(Error::UnknownSigningKey)?;
 
         let cert_bytes =
             postcard::to_allocvec(&cert.certificate).map_err(|_| Error::Serialization)?;
@@ -143,13 +150,13 @@ impl TrustRoot {
     }
 }
 
-/// Issue a signed sender certificate (server-side operation).
+/// Issue a signed sender certificate.
 ///
-/// The server signs the certificate with its Ed25519 key. Clients include
+/// The issuer signs the certificate with its Ed25519 key. Senders include
 /// the resulting [`SignedSenderCertificate`] in every sealed message.
 pub fn issue_certificate<R: RecipientId>(
-    server_signing_key: &SigningKey,
-    server_key_id: ServerKeyId,
+    signing_key: &SigningKey,
+    signing_key_id: SigningKeyId,
     sender: &crate::types::SenderIdentity<R>,
     expires_at: DateTime<Utc>,
 ) -> Result<SignedSenderCertificate<R>> {
@@ -157,11 +164,11 @@ pub fn issue_certificate<R: RecipientId>(
         sender_id: sender.id.clone(),
         identity_key: sender.identity_key,
         expires_at_secs: expires_at.timestamp(),
-        server_key_id,
+        signing_key_id,
     };
 
     let cert_bytes = postcard::to_allocvec(&certificate).map_err(|_| Error::Serialization)?;
-    let signature = server_signing_key.sign(&cert_bytes);
+    let signature = signing_key.sign(&cert_bytes);
 
     Ok(SignedSenderCertificate {
         certificate,
@@ -194,28 +201,28 @@ mod tests {
 
     fn test_fixtures() -> (
         SigningKey,
-        ServerKeyId,
+        SigningKeyId,
         SenderIdentity<Recipient>,
         TrustRoot,
     ) {
-        let server_key = SigningKey::generate(&mut OsRng);
-        let server_key_id = ServerKeyId::new(1);
-        let trust_root = TrustRoot::new(server_key_id, server_key.verifying_key());
+        let issuer_key = SigningKey::generate(&mut OsRng);
+        let signing_key_id = SigningKeyId::new(1);
+        let trust_root = TrustRoot::new(signing_key_id, issuer_key.verifying_key());
 
         let sender = SenderIdentity {
             id: Recipient::from_bytes_copy(&[1u8; 16]),
             identity_key: IdentityKey::from_bytes([2u8; 32]),
         };
 
-        (server_key, server_key_id, sender, trust_root)
+        (issuer_key, signing_key_id, sender, trust_root)
     }
 
     #[test]
     fn issue_and_verify_roundtrip() {
-        let (server_key, server_key_id, sender, trust_root) = test_fixtures();
+        let (issuer_key, signing_key_id, sender, trust_root) = test_fixtures();
         let expires = DateTime::<Utc>::MAX_UTC;
 
-        let cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
+        let cert = issue_certificate(&issuer_key, signing_key_id, &sender, expires).unwrap();
 
         assert_eq!(cert.certificate.sender_id, sender.id);
         assert_eq!(cert.certificate.identity_key, sender.identity_key);
@@ -226,10 +233,10 @@ mod tests {
 
     #[test]
     fn rejects_expired_certificate() {
-        let (server_key, server_key_id, sender, trust_root) = test_fixtures();
+        let (issuer_key, signing_key_id, sender, trust_root) = test_fixtures();
         let expires = Utc.timestamp_opt(1000, 0).unwrap();
 
-        let cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
+        let cert = issue_certificate(&issuer_key, signing_key_id, &sender, expires).unwrap();
 
         let err = verify_certificate(&trust_root, &cert, expires).unwrap_err();
         assert!(matches!(err, Error::CertificateExpired));
@@ -241,24 +248,24 @@ mod tests {
 
     #[test]
     fn accepts_not_yet_expired() {
-        let (server_key, server_key_id, sender, trust_root) = test_fixtures();
+        let (issuer_key, signing_key_id, sender, trust_root) = test_fixtures();
         let expires = Utc.timestamp_opt(1000, 0).unwrap();
 
-        let cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
+        let cert = issue_certificate(&issuer_key, signing_key_id, &sender, expires).unwrap();
 
         let before = Utc.timestamp_opt(999, 0).unwrap();
         verify_certificate(&trust_root, &cert, before).unwrap();
     }
 
     #[test]
-    fn rejects_wrong_server_key() {
-        let (server_key, server_key_id, sender, _) = test_fixtures();
+    fn rejects_wrong_issuer_key() {
+        let (issuer_key, signing_key_id, sender, _) = test_fixtures();
         let expires = DateTime::<Utc>::MAX_UTC;
 
-        let cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
+        let cert = issue_certificate(&issuer_key, signing_key_id, &sender, expires).unwrap();
 
         let other_key = SigningKey::generate(&mut OsRng);
-        let wrong_trust_root = TrustRoot::new(server_key_id, other_key.verifying_key());
+        let wrong_trust_root = TrustRoot::new(signing_key_id, other_key.verifying_key());
 
         let now = Utc.timestamp_opt(0, 0).unwrap();
         let err = verify_certificate(&wrong_trust_root, &cert, now).unwrap_err();
@@ -266,24 +273,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_server_key_id() {
-        let (server_key, server_key_id, sender, trust_root) = test_fixtures();
+    fn rejects_unknown_signing_key_id() {
+        let (issuer_key, signing_key_id, sender, trust_root) = test_fixtures();
         let expires = DateTime::<Utc>::MAX_UTC;
 
-        let mut cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
-        cert.certificate.server_key_id = ServerKeyId::new(999);
+        let mut cert = issue_certificate(&issuer_key, signing_key_id, &sender, expires).unwrap();
+        cert.certificate.signing_key_id = SigningKeyId::new(999);
 
         let now = Utc.timestamp_opt(0, 0).unwrap();
         let err = verify_certificate(&trust_root, &cert, now).unwrap_err();
-        assert!(matches!(err, Error::UnknownServerKey));
+        assert!(matches!(err, Error::UnknownSigningKey));
     }
 
     #[test]
     fn rejects_tampered_certificate() {
-        let (server_key, server_key_id, sender, trust_root) = test_fixtures();
+        let (issuer_key, signing_key_id, sender, trust_root) = test_fixtures();
         let expires = DateTime::<Utc>::MAX_UTC;
 
-        let mut cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
+        let mut cert = issue_certificate(&issuer_key, signing_key_id, &sender, expires).unwrap();
         cert.certificate.sender_id = Recipient::from_bytes_copy(&[0xFF; 16]);
 
         let now = Utc.timestamp_opt(0, 0).unwrap();
@@ -293,10 +300,10 @@ mod tests {
 
     #[test]
     fn postcard_serialization_deterministic() {
-        let (server_key, server_key_id, sender, _) = test_fixtures();
+        let (issuer_key, signing_key_id, sender, _) = test_fixtures();
         let expires = Utc.timestamp_opt(12345, 0).unwrap();
 
-        let cert = issue_certificate(&server_key, server_key_id, &sender, expires).unwrap();
+        let cert = issue_certificate(&issuer_key, signing_key_id, &sender, expires).unwrap();
 
         let bytes1 = cert.serialize_certificate().unwrap();
         let bytes2 = cert.serialize_certificate().unwrap();
@@ -305,13 +312,13 @@ mod tests {
 
     #[test]
     fn trust_root_key_rotation() {
-        let server_key_1 = SigningKey::generate(&mut OsRng);
-        let server_key_2 = SigningKey::generate(&mut OsRng);
-        let key_id_1 = ServerKeyId::new(1);
-        let key_id_2 = ServerKeyId::new(2);
+        let issuer_key_1 = SigningKey::generate(&mut OsRng);
+        let issuer_key_2 = SigningKey::generate(&mut OsRng);
+        let key_id_1 = SigningKeyId::new(1);
+        let key_id_2 = SigningKeyId::new(2);
 
-        let mut trust_root = TrustRoot::new(key_id_1, server_key_1.verifying_key());
-        trust_root.add_key(key_id_2, server_key_2.verifying_key());
+        let mut trust_root = TrustRoot::new(key_id_1, issuer_key_1.verifying_key());
+        trust_root.add_key(key_id_2, issuer_key_2.verifying_key());
 
         let sender = SenderIdentity {
             id: Recipient::from_bytes_copy(&[1u8; 16]),
@@ -319,8 +326,8 @@ mod tests {
         };
         let expires = DateTime::<Utc>::MAX_UTC;
 
-        let cert1 = issue_certificate(&server_key_1, key_id_1, &sender, expires).unwrap();
-        let cert2 = issue_certificate(&server_key_2, key_id_2, &sender, expires).unwrap();
+        let cert1 = issue_certificate(&issuer_key_1, key_id_1, &sender, expires).unwrap();
+        let cert2 = issue_certificate(&issuer_key_2, key_id_2, &sender, expires).unwrap();
 
         let now = Utc.timestamp_opt(0, 0).unwrap();
         verify_certificate(&trust_root, &cert1, now).unwrap();
