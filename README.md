@@ -4,6 +4,12 @@ Sealed sender for MLS. Provides sender anonymity by wrapping encrypted
 ciphertext in a two-stage ECIES envelope. The relay sees only the
 recipient; the recipient recovers the sender's verified identity.
 
+## Deprecated
+
+Hushwire has discontinued work on this library as it moved away from MLS. 
+It will remain public and available since this crate has been published to
+crates.io.
+
 ## How it works
 
 The sender wraps an already-encrypted inner ciphertext (e.g. an MLS application
